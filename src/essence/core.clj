@@ -1,46 +1,32 @@
 (ns essence.core
   (:require [clojure.string :as str]
             [clojure.core.match :refer [match]]
+            [clojure.walk :refer [postwalk]]
             [essence.env :as env]))
 
-(def ^:dynamic *core-ctx*
-  "Core function types."
-  {'defn {:kind :macro}
-   'fn {:kind :special-form}
-   'let {:kind :special-form}
-   'if {:kind :special-form}
-   '+ {:kind :fn :args [{:kind :number} {:kind :number}] :ret {:kind :number}}
-   '- {:kind :fn :args [{:kind :number} {:kind :number}] :ret {:kind :number}}
-   '* {:kind :fn :args [{:kind :number} {:kind :number}] :ret {:kind :number}}
-   '/ {:kind :fn :args [{:kind :number} {:kind :number}] :ret {:kind :number}}
-   '< {:kind :fn :args [{:kind :number} {:kind :number}] :ret {:kind :boolean}}
-   '<= {:kind :fn :args [{:kind :number} {:kind :number}] :ret {:kind :boolean}}
-   '> {:kind :fn :args [{:kind :number} {:kind :number}] :ret {:kind :boolean}}
-   '>= {:kind :fn :args [{:kind :number} {:kind :number}] :ret {:kind :boolean}}
-   '= {:kind :fn :args [{:kind :tvar :value 0 :scope '=} {:kind :tvar :value 0 :scope '=}] :ret {:kind :boolean}}
-   'not= {:kind :fn :args [{:kind :tvar :value 0 :scope 'not=} {:kind :tvar :value 0 :scope 'not=}] :ret {:kind :boolean}}
-   'and {:kind :fn :args [{:kind :boolean} {:kind :boolean}] :ret {:kind :boolean}}
-   'or {:kind :fn :args [{:kind :boolean} {:kind :boolean}] :ret {:kind :boolean}}
-   'true? {:kind :fn :args [{:kind :boolean}] :ret {:kind :boolean}}
-   'false? {:kind :fn :args [{:kind :boolean}] :ret {:kind :boolean}}})
+(declare with-type assign-type assign-fn-type print-type-assignments eqt
+         applicable? gen-type-equations gen-fn-type-equations unify unify-var
+         check-occurrence unify-eqs substitute-type retype rename type= seq-type= type
+         format-type print-substitutions print-type-equations eval fold-fns)
 
 (defn with-type
   "Returns `form` with `type` assigned to its metadata."
   [form type]
   (assert (map? type) "type must be a map")
-  (vary-meta form assoc :kind type))
+  (vary-meta (if (var? form) (var-get form) form) assoc :kind type))
 
 (defn assign-type
   "Assigns symbolic type for given `form` and its subforms in the given `env`."
   ([env form] (assign-type env form (ns-name *ns*)))
   ([env form scope]
    (match form
-     (['defn name args body] :seq) (assign-fn-type env 'defn name args body name)
-     (['defn docstring name args body] :seq) (assign-fn-type env 'defn name args body name docstring)
+     (['defn name args body] :seq) (assign-fn-type env 'defn scope args body name)
+     (['defn docstring name args body] :seq) (assign-fn-type env 'defn scope args body name docstring)
      (['fn args body] :seq) (assign-fn-type env 'fn (str "fn-" (hash form)) args body)
      (['if & rest] :seq) (with-type `(~(assign-type env 'if scope) ~@(map #(assign-type env % scope) rest))
-                           (env/make-tvar env))
-     (['let bindings body] :seq) (let [formt (env/make-tvar env)
+                           (env/make-tvar env scope))
+     ;; TODO: Replace with arg destructuring & macros
+     (['let bindings body] :seq) (let [formt (env/make-tvar env scope)
                                        bindings (map (fn [[name value]]
                                                        [(with-type name (env/make-tvar env scope))
                                                         (assign-type env value)])
@@ -57,7 +43,7 @@
                       (with-type (into () (reverse items)) (env/make-tvar env)))
        (symbol? form) (with-type form (or (env/resolve env form)
                                           (env/make-tvar env scope)))
-       (some-fn string? number? boolean? keyword? form) form
+       ((some-fn string? number? boolean? keyword?) form) form
        :else (throw (ex-info "unhandled form" {:form form}))))))
 
 (defn assign-fn-type
@@ -67,7 +53,7 @@
   ([env t scope args body name? docstring?]
    (let [formt (env/make-tvar env)
          name (when name? (with-type name? (env/make-tvar env)))
-         args (vec (map #(with-type % (env/make-tvar env scope)) args))
+         args (mapv #(with-type % (env/make-tvar env scope)) args)
          argv (with-type args {:kind :vector :items args})
          local-env (env/copy env (->> (map #(vector % (type %)) args)
                                       (into {})))
@@ -138,6 +124,8 @@
                                                    (eqt (type first) {:kind :fn :args (mapv type rest) :ret (type form)} form))
                         :else (conj eqs
                                     (eqt (type form) {:kind :list :items (map type form)} form))))
+       ;; (vector? form) (let [eqs (concat equations (mapcat gen-type-equations form))]
+       ;;                  (conj eqs (eqt (type form) {:kind :vector :items items})))
        (number? form) (conj equations (eqt (type form) {:kind :number} form))
        (string? form) (conj equations (eqt (type form) {:kind :string} form))
        (boolean? form) (conj equations (eqt (type form) {:kind :boolean} form))
@@ -219,14 +207,15 @@
      (= (:kind type) :string) type
      (= (:kind type) :macro) type
      (= (:kind type) :special-form) type
-                                        ;(= (:kind type) :vector) {:kind :vector :items (mapv #(substitute-type % subst (conj visited type)) (:items type))}
+     (= (:kind type) :vector) {:type :vector :items (mapv #(substitute-type % subst (conj visited type)) (:items type))}
+     ;(= (:kind type) :vector) {:kind :vector :items (mapv #(substitute-type % subst (conj visited type)) (:items type))}
      (= (:kind type) :tvar) (if (and (contains? subst type) (not (contains? visited type)))
                               (substitute-type (get subst type) subst (conj visited type))
                               type)
      (= (:kind type) :fn) {:kind :fn
                            :args (mapv #(substitute-type % subst (conj visited type)) (:args type))
                            :ret (substitute-type (:ret type) subst (conj visited type))}
-     :else nil)))
+     :else nil)));(throw (ex-info (format "cannot substitute type %s" (format-type type)) {:type type :subst subst})))))
 
 (comment
   (substitute-type {:kind :tvar :value 0}
@@ -243,9 +232,9 @@
   (let [type (-> (substitute-type (type form) subst)
                  (rename names))]
     (cond
-      (list? form) (with-type (map #(retype % subst names) form) type)
-      (vector? form) (let [types (map #(retype % subst names) form)]
-                       (with-type (vec types) {:kind :vector :items types}))
+      (list? form) (with-type (apply list (map #(retype % subst names) form)) type)
+      (vector? form) (let [types (mapv #(retype % subst names) form)]
+                       (with-type types {:kind :vector :items types}))
       (map? form) (with-type (into {} (map #(vector (retype (first %) subst names) (retype (second %) subst names)) form)) type)
       (symbol? form) (with-type form type)
       :else form)))
@@ -294,6 +283,8 @@
     (boolean? form) {:kind :boolean}
     (string? form) {:kind :string}
     (keyword? form) {:kind :keyword :name (str form)}
+                                        ;(symbol? form) (env/resolve form)
+    ;(var? form) (type (var-get form))
     :else (-> form meta :kind)))
 
 (defn format-type
@@ -307,7 +298,7 @@
     {:kind :string} (format "Str")
     {:kind :boolean} (format "Bool")
     {:kind :keyword :name name} (format name)
-    {:kind :tvar :value val} (format "t%d" val)
+    {:kind :tvar :value val} (str (char (+ val 65))) ;(format "t%d" val)
     {:kind :tvar :value val :scope scope} (format "%s/t%d" (str scope) val)
     :else "nil"))
 
@@ -316,13 +307,26 @@
   (clojure.pprint/print-table (mapv (fn [s] {:from (format-type (first s)) :to (format-type (second s))}) subst)))
 
 (defn print-type-equations
-  "Pretty prints a sequence of type equations as a table."
+  "Prints a sequence of type equations as a table."
   [eqs]
   (print "Type equations:")
   (clojure.pprint/print-table
    (map (fn [{l :left r :right f :form}]
           { "form" f "left" (format-type l) "right" (format-type r)})
         eqs)))
+
+(defn eval-and-bind
+  "Evaluates typed form `tform` and conditionally binds the result in a var so its type can be assigned."
+  [tform]
+  (assert (type tform) "type cannot be nil")
+  (let [result (clojure.core/eval (vary-meta tform dissoc :kind))
+        bound (if (fn? result) ; Bind anonymous functions so we can store their type
+                (intern *ns* (symbol (str "fn-" (hash result))) result)
+                result)]
+    (when ((some-fn var? symbol? coll?) bound)
+      (println "altered meta of" bound "with" (format-type (type tform)))
+      (alter-meta! bound assoc :kind (type tform)))
+    bound))
 
 (defn eval
   ([form] (eval form (env/from-ns)))
@@ -331,36 +335,52 @@
          eqts (gen-type-equations form)
          subst (unify-eqs eqts)
          names (atom {})]
-     ;; (print-type-assignments form)
-     ;; (print-type-equations eqts)
-     ;; (print-substitutions subst)
+     (print-type-assignments form)
+     (print-type-equations eqts)
+     (print-substitutions subst)
      (alter-meta! names assoc :count 0)
      (let [typed-form (retype form subst names)
-           result (clojure.core/eval typed-form)]
-       (when (var? result)
-         (alter-meta! result assoc :kind (type typed-form)))
-       result))))
+           folded-form (fold typed-form true)]
+       (eval-and-bind folded-form)))))
+
+(defn fold [form top-level]
+  (match form
+    (['fn args body] :seq) (if top-level
+                             (with-type (eval-and-bind form) (type form))
+                             (vary-meta form dissoc :kind))
+    :else
+    (cond
+      (list? form) (with-type (apply list (map #(fold % false) form)) (type form))
+      (vector? form) (with-type (mapv #(fold % false) form) (type form))
+      :else form)))
 
 ;; Demo
 (comment
-  (alter-meta! *ns* assoc :env (env/make *core-ctx*))
+  (alter-meta! *ns* assoc :env (env/make env/*core-ctx*))
 
   (-> '(defn foo [f g x]
          (if (f (= x 1))
            (g x)
            20))
       eval type format-type)
-  (-> '(defn square [x] (* x x)) eval type format-type)
-  (-> '(foo false? square true) eval)
 
-  (-> '(defn foo [f] (f 5))
-      eval type format-type)
+  (-> '((fn [x] (+ x 1)) 1) eval type format-type)
+  
+  (-> '[1 2 3] eval)
+  (-> '{:foo 1 :bar true} eval)
+  
+  (-> '(defn square [x] (* x x)) eval type format-type)
+  (-> '(foo false? (fn [x] (* x x)) 5) eval)
+  
+  (-> '(defn foo [f] (f 5)) eval type format-type)
+  (-> 'identity env/resolve format-type)
+  (-> '(foo identity) eval)
 
   (-> '(defn foo [f x]
          (- (f 3) (f x)))
       eval type format-type)
 
-  (-> '(defn foo [f]
+  (-> '(fn [f]
          (fn [t] (f t)))
       eval type format-type)
 
@@ -369,5 +389,4 @@
            (fn [t] (f t))
            (fn [j] (f x))))
       eval type format-type)
-  
   )
