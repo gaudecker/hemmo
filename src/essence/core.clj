@@ -43,6 +43,12 @@
                       (with-type (into () (reverse items)) (env/make-tvar env)))
        (vector? form) (let [items (mapv #(assign-type env % scope) form)]
                         (with-type items (env/make-tvar env)))
+       (map? form) (let [content (->> (map (fn [[key val]]
+                                            [(assign-type env key scope)
+                                             (assign-type env val scope)])
+                                          form)
+                                     (into {}))]
+                     (with-type content (env/make-tvar env scope)))
        (symbol? form) (with-type form (or (env/resolve env form)
                                           (env/make-tvar env scope)))
        ((some-fn string? number? boolean? keyword?) form) form
@@ -124,11 +130,17 @@
                       (cond
                         (applicable? optype) (conj eqs
                                                    (eqt (type first) {:kind :fn :args (mapv type rest) :ret (type form)} form))
-                        :else (conj eqs
-                                    (eqt (type form) {:kind :list :items (map type form)} form))))
+                        :else (conj eqs (eqt (type form) {:kind :list :items (map type form)} form))))
        (vector? form) (let [eqs (concat equations (mapcat gen-type-equations form))]
                         (conj eqs
                               (eqt (type form) {:kind :vector :items (map type form)} form)))
+       (map? form) (let [eqs (concat equations (mapcat (fn [[key val]]
+                                                         (concat (gen-type-equations key)
+                                                                 (gen-type-equations val)))
+                                                       form))]
+                     (conj eqs (eqt (type form)
+                                    {:kind :map :pairs (->> (map #(vector (type (first %)) (type (second %))) form) (into {}))}
+                                    form)))
        (number? form) (conj equations (eqt (type form) {:kind :number} form))
        (string? form) (conj equations (eqt (type form) {:kind :string} form))
        (boolean? form) (conj equations (eqt (type form) {:kind :boolean} form))
@@ -151,6 +163,8 @@
     (= (:kind type) :fn) (or (occurs-in? var (:ret type) subst)
                              (some #(occurs-in? var % subst) (:args type)))
     (= (:kind type) :vector) (some #(occurs-in? var % subst) (:items type))
+    (= (:kind type) :map) (or (some #(occurs-in? var % subst) (keys type))
+                              (some #(occurs-in? var % subst) (vals type)))
     :else false))
 
 (defn unify-var
@@ -190,6 +204,16 @@
                                    (reduce (fn [subst [i1 i2]] (unify i1 i2 subst)) subst (map list (:items t1) (:items t2)))
                                    (throw (ex-info (format "incompatible vectors: expected %d items, got %d" (count (:items t1)) (count (:items t2)))
                                                    {:t1 t1 :t2 t2})))
+    (and (= (:kind t1) :map)
+         (= (:kind t2) :map)) (if (= (count (:pairs t1))
+                                     (count (:pairs t2)))
+                                (reduce (fn [subst [[k1 v1] [k2 v2]]]
+                                          (println "unifying maps" k1 v1 "and" k2 v2)
+                                          (merge subst (unify k1 k2 subst) (unify v1 v2 subst)))
+                                        subst
+                                        (map list (:pairs t1) (:pairs t2)))
+                                (throw (ex-info (format "incompatible maps: expected %d pairs, got %d" (count (:pairs t1)) (count (:pairs t2)))
+                                                {:t1 t1 :t2 t2})))
     :else (throw (ex-info (format "type mismatch. expected %s, got %s"
                                   (format-type t1) (format-type t2))
                           {:t1 t1 :t2 t2}))))
@@ -217,8 +241,13 @@
      (= (:kind type) :number) type
      (= (:kind type) :string) type
      (= (:kind type) :macro) type
+     (= (:kind type) :keyword) type
      (= (:kind type) :special-form) type
      (= (:kind type) :vector) {:kind :vector :items (mapv #(substitute-type % subst (conj visited type)) (:items type))}
+     (= (:kind type) :map) {:kind :map :pairs (-> (map (fn [[key val]] [(substitute-type key subst (conj visited type))
+                                                                        (substitute-type val subst (conj visited type))])
+                                                       (:pairs type))
+                                                  (into {}))}
      (= (:kind type) :tvar) (if (and (contains? subst type) (not (contains? visited type)))
                               (substitute-type (get subst type) subst (conj visited type))
                               type)
@@ -254,6 +283,11 @@
                                               :items (map #(rename % names) items)}]
                                    (swap! names assoc type value value value)
                                    value)
+    {:kind :map :pairs pairs} (let [value {:kind :map :pairs (-> (map (fn [[key val]] [(rename key names) (rename val names)])
+                                                                      (:pairs type))
+                                                                 (into {}))}]
+                                (swap! names assoc type value value value)
+                                value)
     :else type))
 
 (defn type=
@@ -267,8 +301,11 @@
     [{:kind :tvar :value v1 :scope s1} {:kind :tvar :value v2 :scope s2}] (and (= v1 v2) (= s1 s2))
     [{:kind :list :items i1} {:kind :list :items i2}] (seq-type= i1 i2)
     [{:kind :vec :items i1} {:kind :vec :items i2}] (seq-type= i1 i2)
+    [{:kind :map :pairs p1} {:kind :map :pairs p2}] (= p1 p2)
     [{:kind :fn :args a1 :ret r1} {:kind :fn :args a2 :ret r2}] (and (type= r1 r2) (seq-type= a1 a2))
-    :else false))
+    :else (cond
+            (every? (some-fn keyword? number? string? boolean?) [t1 t2]) (= t1 t2)
+            :else false)))
 
 (defn seq-type= [s1 s2]
   (and (= (count s1) (count s2))
@@ -291,10 +328,11 @@
     {:kind :fn :args args :ret ret} (format "[%s] → %s" (str/join ", " (map format-type args)) (format-type ret))
     {:kind :list :items items} (format "(%s)" (str/join " " (map format-type items)))
     {:kind :vector :items items} (format "[%s]" (str/join " " (map format-type items)))
+    {:kind :map :pairs pairs} (format "{%s}" (str/join ", " (map #(str (format-type (first %)) " " (format-type (second %))) pairs)))
     {:kind :number} (format "Num")
     {:kind :string} (format "Str")
     {:kind :boolean} (format "Bool")
-    {:kind :keyword :name name} (format name)
+    {:kind :keyword :name name} (str name)
     {:kind :tvar :value val} (str (char (+ val 65))) ;(format "t%d" val)
     {:kind :tvar :value val :scope scope} (format "%s/t%d" (str scope) val)
     :else (when ((some-fn number? boolean? string? keyword?) t)
@@ -368,8 +406,9 @@
 
   (-> '((fn [x] (+ x 1)) 1) eval type format-type)
   
-  (-> '(if true [1 2] [1 true]) eval type format-type)
-  (-> '{:foo 1 :bar true} eval)
+  (-> '(if true [1 2] [1 3]) eval type format-type)
+  (-> '{:foo 1 :bar true} eval type format-type)
+  (-> '(if true {:foo 1} {:foo 2}) eval type format-type)
   
   (-> '(defn square [x] (* x x)) eval type format-type)
   (-> '(foo false? (fn [x] (* x x)) 5) eval)
