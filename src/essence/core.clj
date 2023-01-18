@@ -12,7 +12,7 @@
 (defn with-type
   "Returns `form` with `type` assigned to its metadata."
   [form type]
-  (assert (map? type) "type must be a map")
+  (assert (map? type) (format "type must be a map, got %s" type))
   (vary-meta (if (var? form) (var-get form) form) assoc :kind type))
 
 (defn assign-type
@@ -61,10 +61,9 @@
   ([env t scope args body name? docstring?]
    (let [formt (env/make-tvar env)
          name (when name? (with-type name? (env/make-tvar env)))
-         args (mapv #(with-type % (env/make-tvar env scope)) args)
+         args (mapv #(assign-destructuring-type env % scope) args)
          argv (with-type args {:kind :vector :items args})
-         local-env (env/copy env (->> (map #(vector % (type %)) args)
-                                      (into {})))
+         local-env (env/copy env (args-to-env args))
          body (assign-type local-env body scope)
          sym (with-type t (env/resolve env t))]
      (with-type (cond
@@ -73,6 +72,57 @@
                                   (list sym name argv body))
                   (= sym 'fn) (list sym argv body))
        formt))))
+
+(defn assign-destructuring-type
+  "Assigns symbolic type for a destructuring form."
+  [env form scope]
+  (cond
+    (symbol? form) (with-type form (env/make-tvar env scope))
+    (vector? form) (with-type (mapv #(assign-destructuring-type env % scope) form) (env/make-tvar env scope))
+    (map? form) (with-type (->> (map (fn [[val key]]
+                                       (cond
+                                         (= val :or) [:or (assign-type env key scope)]
+                                         (= val :as) [:as (with-type key (env/make-tvar env scope))]
+                                         (keyword? key) [(assign-destructuring-type env val scope) key]
+                                         :else (throw (ex-info "invalid map destructuring pair" {:left val :right key}))))
+                                     form)
+                                (into {}))
+                  (env/make-tvar env scope))
+    :else (throw (ex-info "invalid argument form" {:form form}))))
+
+(defn destructuring-bindings
+  "Returns a vector of bound symbols from a destructuring form."
+  ([form] (destructuring-bindings form []))
+  ([form bindings]
+   (cond
+     (symbol? form) (conj bindings form)
+     (vector? form) (reduce (fn [bindings form]
+                              (concat bindings (destructuring-bindings form)))
+                            bindings form)
+     (map? form) (reduce (fn [bindings [val key]]
+                           (cond
+                             (and (= val :or) (map? key)) bindings
+                             (and (= val :as) (symbol? key)) (conj bindings key)
+                             (keyword? key) (concat bindings (destructuring-bindings val))
+                             :else (throw (ex-info "invalid map destructuring pair" {:left val :right key}))))
+                         bindings form)
+     :else (throw (ex-info "invalid destructuring form" {:form form})))))
+
+(defn args-to-env
+  "Maps bound symbols from given argument vector `args` to their type."
+  ([args] (args-to-env args {}))
+  ([args env]
+   (->> (map #(vector % (type %)) (destructuring-bindings args))
+        (into {}))))
+
+(comment
+  (args-to-env (->> '[a [b c] {d :d :as all}]
+                    (assign-type (env/from-ns)))))
+
+(comment
+  (destructuring-bindings 'foo)
+  (destructuring-bindings '{foo :foo {bar :bar} :baz :as all})
+  (destructuring-bindings '[foo bar {a :a [b c] :d :or {a "baz"} :as third}]))
 
 (defn print-type-assignments
   [form]
@@ -151,9 +201,35 @@
 (defn gen-fn-type-equations
   "Generates type equations for a function form."
   [form args body equations]
-  (let [eqs (gen-type-equations body equations)]
+  (let [eqs (concat (reduce #(gen-destructuring-type-equations %2 %1) equations args)
+                    (gen-type-equations body))]
     (conj eqs 
           (eqt (type form) {:kind :fn :args (mapv type args) :ret (type body)} form))))
+
+(defn gen-destructuring-type-equations
+  ([form] (gen-destructuring-type-equations form []))
+  ([form equations]
+   (cond
+     (symbol? form) equations
+     (vector? form) (conj (reduce #(gen-destructuring-type-equations %2 %1) equations form)
+                          (eqt (type form) {:kind :vector :items (mapv type form)} form))
+     (map? form) (let [eqs (reduce (fn [eqs [val key]]
+                                     (cond
+                                       ;; :as binding gets the type of the surrounding map form
+                                       (and (= val :as) (symbol? key)) (conj eqs (eqt (type key) (type form) form))
+                                       ;; :or symbols get the type of their form
+                                       (and (= val :or) (map? key)) (concat eqs (map #(eqt (type (first %)) (type (second %)) %) key))
+                                       ;; keyword binding gets destructured further (val is either sym, vec, or map)
+                                       (keyword? key) (gen-destructuring-type-equations val eqs)
+                                       :else (throw (ex-info "invalid destructuring form" {:form form}))))
+                                   equations form)]
+                   (println "form" form)
+                   (conj eqs (eqt (type form)
+                                  {:kind :map :pairs (->> (filter #(and (not= (first %) :or) (not= (first %) :as)) form)
+                                                          (map #(vector (type (second %)) (type (first %))))
+                                                          (into {}))}
+                                  form)))
+     :else (throw (ex-info "invalid destructuring form" {:form form})))))
 
 (defn occurs-in? [var type subst]
   (cond
@@ -274,13 +350,10 @@
                          (alter-meta! names update :count inc)
                          (swap! names assoc type value value value)
                          value))
-    {:kind :fn :args args :ret ret} (let [value {:kind :fn
-                                                 :args (map #(rename % names) args)
-                                                 :ret (rename ret names)}]
+    {:kind :fn :args args :ret ret} (let [value {:kind :fn :args (map #(rename % names) args) :ret (rename ret names)}]
                                       (swap! names assoc type value value value)
                                       value)
-    {:kind :vector :items items} (let [value {:kind :vector
-                                              :items (map #(rename % names) items)}]
+    {:kind :vector :items items} (let [value {:kind :vector :items (map #(rename % names) items)}]
                                    (swap! names assoc type value value value)
                                    value)
     {:kind :map :pairs pairs} (let [value {:kind :map :pairs (-> (map (fn [[key val]] [(rename key names) (rename val names)])
@@ -322,7 +395,7 @@
     :else (-> form meta :kind)))
 
 (defn format-type
-  "Formats given type `t` for pretty printing."
+  "Formats given type `t` for printing."
   [t]
   (match t
     {:kind :fn :args args :ret ret} (format "[%s] → %s" (str/join ", " (map format-type args)) (format-type ret))
@@ -353,17 +426,17 @@
 
 (defn eval-and-bind
   "Evaluates typed form `tform` and conditionally binds the result in a var so its type can be assigned."
-  [tform]
-  (assert (type tform) "type cannot be nil")
-  (let [result (clojure.core/eval (vary-meta tform dissoc :kind))
+  [form]
+  (assert (type form) "type cannot be nil")
+  (let [result (clojure.core/eval (vary-meta form dissoc :kind))
         bound (if (fn? result) ; Bind anonymous functions so we can store their type
                 (intern *ns* (symbol (str "fn-" (hash result))) result)
                 result)]
     (cond
       (or (instance? clojure.lang.Ref bound)
-          ((some-fn var? symbol?) bound)) (do (alter-meta! bound assoc :kind (type tform))
+          ((some-fn var? symbol?) bound)) (do (alter-meta! bound assoc :kind (type form))
                                               bound)
-      (coll? bound) (vary-meta bound assoc :kind (type tform))
+      (coll? bound) (vary-meta bound assoc :kind (type form))
       :else bound)))
 
 (defn eval
@@ -379,11 +452,11 @@
      (alter-meta! names assoc :count 0)
      (let [typed-form (retype form subst names)
            folded-form (fold typed-form true)]
-       (println "typed" typed-form (format-type (type typed-form)))
-       (println "flded" folded-form (format-type (type folded-form)))
        (eval-and-bind folded-form)))))
 
-(defn fold [form top-level]
+(defn fold
+  "Folds (evaluate & replace) form and its subforms conditionally."
+  [form top-level]
   (match form
     (['fn args body] :seq) (if top-level
                              (with-type (eval-and-bind form) (type form))
@@ -409,6 +482,9 @@
   (-> '(if true [1 2] [1 3]) eval type format-type)
   (-> '{:foo 1 :bar true} eval type format-type)
   (-> '(if true {:foo 1} {:foo 2}) eval type format-type)
+
+  (-> '(fn [[a b]] (+ a b)) eval type format-type)
+  (-> '(fn [{a :a b :b :or {a true}}] (+ a b)) eval type format-type)
   
   (-> '(defn square [x] (* x x)) eval type format-type)
   (-> '(foo false? (fn [x] (* x x)) 5) eval)
