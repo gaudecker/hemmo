@@ -79,15 +79,23 @@
   (cond
     (symbol? form) (with-type form (env/make-tvar env scope))
     (vector? form) (with-type (mapv #(assign-destructuring-type env % scope) form) (env/make-tvar env scope))
-    (map? form) (with-type (->> (map (fn [[val key]]
-                                       (cond
-                                         (= val :or) [:or (assign-type env key scope)]
-                                         (= val :as) [:as (with-type key (env/make-tvar env scope))]
-                                         (keyword? key) [(assign-destructuring-type env val scope) key]
-                                         :else (throw (ex-info "invalid map destructuring pair" {:left val :right key}))))
-                                     form)
-                                (into {}))
-                  (env/make-tvar env scope))
+    (map? form) (let [locals (atom {})]
+                  (with-type (->> (map (fn [[val key]]
+                                         (cond
+                                           (= val :or) [:or (->> (map (fn [[val binding]]
+                                                                        (let [env (env/copy env @locals)]
+                                                                          [(assign-type env val scope) (assign-type env binding scope)]))
+                                                                      key)
+                                                                 (into {}))]
+                                           (= val :as) [:as (with-type key (env/make-tvar env scope))]
+                                           (keyword? key) (let [val (assign-destructuring-type env val scope)]
+                                                            (when (symbol? val)
+                                                              (swap! locals assoc val (type val)))
+                                                            [val key])
+                                           :else (throw (ex-info "invalid map destructuring pair" {:left val :right key}))))
+                                       form)
+                                  (into {}))
+                    (env/make-tvar env scope)))
     :else (throw (ex-info "invalid argument form" {:form form}))))
 
 (defn destructuring-bindings
@@ -108,6 +116,11 @@
                          bindings form)
      :else (throw (ex-info "invalid destructuring form" {:form form})))))
 
+(comment
+  (destructuring-bindings 'foo)
+  (destructuring-bindings '{foo :foo {bar :bar} :baz :as all})
+  (destructuring-bindings '[foo bar {a :a [b c] :d :or {a "baz"} :as third}]))
+
 (defn args-to-env
   "Maps bound symbols from given argument vector `args` to their type."
   ([args] (args-to-env args {}))
@@ -118,11 +131,6 @@
 (comment
   (args-to-env (->> '[a [b c] {d :d :as all}]
                     (assign-type (env/from-ns)))))
-
-(comment
-  (destructuring-bindings 'foo)
-  (destructuring-bindings '{foo :foo {bar :bar} :baz :as all})
-  (destructuring-bindings '[foo bar {a :a [b c] :d :or {a "baz"} :as third}]))
 
 (defn print-type-assignments
   [form]
@@ -135,20 +143,14 @@
     (print "Type assignments:")
     (clojure.pprint/print-table @assignments)))
 
-(defn eqt
-  "Returns a type equation with a `left` and `right` expressions and a reference
-  `form`."
-  [left right form]
-  {:left left :right right :form form})
-
 (defn applicable?
   "Returns true if the given `type` is applicable." ; TODO: Consider keywords as applicable
   [type]
   (or (= (:kind type) :tvar) (= (:kind type) :fn)))
 
 (defn gen-type-equations
-  "Returns a vector of type equations for the given `form` and its subforms."
-  ([form] (gen-type-equations form []))
+  "Returns a map of type equations for the given `form` and its subforms."
+  ([form] (gen-type-equations form {}))
   ([form equations]
    (match form
      (['defn docstring name args body] :seq) (gen-fn-type-equations form args body equations)
@@ -157,79 +159,72 @@
      (['if cond then else] :seq) (let [eqs (->> (gen-type-equations cond equations)
                                                 (gen-type-equations then)
                                                 (gen-type-equations else))]
-                                   (conj eqs
-                                         (eqt (type cond) {:kind :boolean} cond)
-                                         (eqt (type form) (type then) then)
-                                         (eqt (type form) (type else) else)))
+                                   (assoc eqs
+                                         (type cond) {:kind :boolean}
+                                         (type form) (type then)
+                                         (type form) (type else)))
      (['let bindings body] :seq) (let [eqs (gen-type-equations body equations)
-                                       binding-eqs (mapcat (fn [[binding value :as form]]
-                                                             (let [eqs (->> (gen-type-equations binding)
+                                       binding-eqs (reduce (fn [eqs [binding value]]
+                                                             (let [eqs (->> (gen-type-equations binding eqs)
                                                                             (gen-type-equations value))]
-                                                               (conj eqs (eqt (type binding)
-                                                                              (type value)
-                                                                              form))))
-                                                           (partition 2 bindings))]
-                                   (concat (conj eqs (eqt (type form) (type body) form))
-                                           binding-eqs))
+                                                               (assoc eqs (type binding) (type value))))
+                                                           eqs (partition 2 bindings))]
+                                   (assoc binding-eqs (type form) (type body)))
      :else
      (cond
        (list? form) (let [[first & rest] form
-                          eqs (concat (gen-type-equations first equations)
-                                      (mapcat gen-type-equations rest))
+                          eqs (conj (gen-type-equations first equations)
+                                    (reduce (fn [eqs n] (gen-type-equations n eqs)) {} rest))
                           optype (type first)]
                       (cond
-                        (applicable? optype) (conj eqs
-                                                   (eqt (type first) {:kind :fn :args (mapv type rest) :ret (type form)} form))
-                        :else (conj eqs (eqt (type form) {:kind :list :items (map type form)} form))))
-       (vector? form) (let [eqs (concat equations (mapcat gen-type-equations form))]
-                        (conj eqs
-                              (eqt (type form) {:kind :vector :items (map type form)} form)))
-       (map? form) (let [eqs (concat equations (mapcat (fn [[key val]]
-                                                         (concat (gen-type-equations key)
-                                                                 (gen-type-equations val)))
-                                                       form))]
-                     (conj eqs (eqt (type form)
-                                    {:kind :map :pairs (->> (map #(vector (type (first %)) (type (second %))) form) (into {}))}
-                                    form)))
-       (number? form) (conj equations (eqt (type form) {:kind :number} form))
-       (string? form) (conj equations (eqt (type form) {:kind :string} form))
-       (boolean? form) (conj equations (eqt (type form) {:kind :boolean} form))
-       (keyword? form) (conj equations (eqt (type form) {:kind :keyword :name (str form)} form))
+                        (applicable? optype) (assoc eqs (type first) {:kind :app :args (mapv type rest) :ret (type form)})
+                        :else (assoc eqs (type form) {:kind :list :items (map type form)})))
+       (vector? form) (let [eqs (reduce #(gen-type-equations %2 %1) equations form)]
+                        (assoc eqs (type form) {:kind :vector :items (map type form)}))
+       (map? form) (let [eqs (reduce (fn [eqs [key val]]
+                                       (conj eqs (gen-type-equations key) (gen-type-equations val)))
+                                     equations form)]
+                     (assoc eqs (type form) {:kind :map :pairs (->> (map #(vector (type (first %)) (type (second %))) form) (into {}))}))
+       (number? form) (assoc equations (type form) {:kind :number})
+       (string? form) (assoc equations (type form) {:kind :string})
+       (boolean? form) (assoc equations (type form) {:kind :boolean})
+       (keyword? form) (assoc equations (type form) {:kind :keyword :name (str form)})
        (symbol? form) equations
        :else (throw (ex-info "unsupported form" {:form form}))))))
 
 (defn gen-fn-type-equations
   "Generates type equations for a function form."
   [form args body equations]
-  (let [eqs (concat (reduce #(gen-destructuring-type-equations %2 %1) equations args)
-                    (gen-type-equations body))]
-    (conj eqs 
-          (eqt (type form) {:kind :fn :args (mapv type args) :ret (type body)} form))))
+  (let [eqs (->> (reduce #(gen-destructuring-type-equations %2 %1) equations args)
+                 (gen-type-equations body))]
+    (assoc eqs (type form) {:kind :fn :args (mapv type args) :ret (type body)})))
 
 (defn gen-destructuring-type-equations
-  ([form] (gen-destructuring-type-equations form []))
+  ([form] (gen-destructuring-type-equations form {}))
   ([form equations]
    (cond
      (symbol? form) equations
-     (vector? form) (conj (reduce #(gen-destructuring-type-equations %2 %1) equations form)
-                          (eqt (type form) {:kind :vector :items (mapv type form)} form))
+     (vector? form) (assoc (reduce #(gen-destructuring-type-equations %2 %1) equations form)
+                           (type form) {:kind :vector :items (mapv type form)})
      (map? form) (let [eqs (reduce (fn [eqs [val key]]
                                      (cond
                                        ;; :as binding gets the type of the surrounding map form
-                                       (and (= val :as) (symbol? key)) (conj eqs (eqt (type key) (type form) form))
+                                       (and (= val :as) (symbol? key)) (assoc eqs (type key) (type form))
                                        ;; :or symbols get the type of their form
-                                       (and (= val :or) (map? key)) (concat eqs (map #(eqt (type (first %)) (type (second %)) %) key))
+                                       (and (= val :or) (map? key)) (reduce (fn [eqs [sym val]]
+                                                                              (assoc eqs (type sym) {:kind :option :value (type val) :default true}))
+                                                                            eqs key)
                                        ;; keyword binding gets destructured further (val is either sym, vec, or map)
                                        (keyword? key) (gen-destructuring-type-equations val eqs)
-                                       :else (throw (ex-info "invalid destructuring form" {:form form}))))
+                                       :else (throw (ex-info "invalid map destructuring form" {:key val :value key :form form}))))
                                    equations form)]
-                   (println "form" form)
-                   (conj eqs (eqt (type form)
-                                  {:kind :map :pairs (->> (filter #(and (not= (first %) :or) (not= (first %) :as)) form)
-                                                          (map #(vector (type (second %)) (type (first %))))
-                                                          (into {}))}
-                                  form)))
+                   (assoc eqs (type form) {:kind :map :pairs (->> (filter #(and (not= (first %) :or) (not= (first %) :as)) form)
+                                                                 (map #(vector (type (second %)) (type (first %))))
+                                                                 (into {}))}))
      :else (throw (ex-info "invalid destructuring form" {:form form})))))
+
+(comment
+  (gen-destructuring-type-equations (assign-type (env/from-ns) '{a :a :or {a 1}})))
 
 (defn occurs-in? [var type subst]
   (cond
@@ -255,25 +250,59 @@
     (occurs-in? var type subst) nil
     :else (assoc subst var type)))
 
+(defn unify-maps
+  "Unifies two maps `t1` and `t2` using substitution map `subst`.
+
+  Returns an updated substitution map."
+  [t1 t2 subst]
+  (let [p1 (:pairs t1) p2 (:pairs t2)]
+    (if (<= (count p1) (count p2))
+      (reduce (fn [subst key]
+                (cond (contains? p2 key) (conj subst (unify (get p1 key) (get p2 key) subst))
+                      (= (:kind (get p1 key)) :option) subst
+                  :else
+                  (throw (ex-info (format "type mismatch: expected %s, got %s" (format-type t1) (format-type t2)) {:t1 t1 :t2 t2}))))
+              subst (keys p1))
+      (throw (ex-info (format "type mismatch: expected %s, got %s" (format-type t1) (format-type t2))
+                      {:t1 t1 :t2 t2})))))
+
+(defn unify-option
+  "Unifies option type `opt` with `type` using substitution map `subst`.
+
+  Returns an updated substitution map."
+  [opt type subst]
+  (if (:default opt) ;; if the option has default value (it is :or bound) we can unify with its unwrapped type.
+    (unify (:value opt) type subst)
+    (throw (ex-info (format "type mismatch: expected %s, got %s" (format-type opt) (format-type type)) {:t1 opt :t2 type}))))
+
+(defn unify-fn-app
+  "Unifies function or application types `t1` and `t2`.
+  
+  Returns an updated substitution map."
+  [t1 t2 subst]
+  (if (= (count (:args t1))
+         (count (:args t2)))
+    (let [subst (unify (:ret t1) (:ret t2) subst)
+          args (map vector (:args t1) (:args t2))]
+      (reduce (fn [subst [a1 a2]] (unify a1 a2 subst)) subst args))
+    (throw (ex-info (format "arity exception: expected %d arguments, got %d" (count (:args t1)) (count (:args t2)))
+                    {:t1 (format-type t1) :t2 (format-type t2)}))))
+
 (defn unify
   "Unifies two types `t1` and `t2` with initial substitution map `subst`.
 
-  Returns a substitution map {name type} that unifies `t1` and `t2`,
+  Returns a substitution map {name -> type} that unifies `t1` and `t2`,
   or `nil` if the types can't be unified."
   [t1 t2 subst]
-  (println "unifying t1" (format-type t1) "t2" (format-type t2))
   (cond
     (= t1 t2) subst
     (= (:kind t1) :tvar) (unify-var t1 t2 subst)
     (= (:kind t2) :tvar) (unify-var t2 t1 subst)
-    (and (= (:kind t1) :fn)
-         (= (:kind t2) :fn)) (if (= (count (:args t1))
-                                      (count (:args t2)))
-                               (let [subst (unify (:ret t1) (:ret t2) subst)
-                                     args (map list (:args t1) (:args t2))]
-                                 (reduce (fn [subst [a1 a2]] (unify a1 a2 subst)) subst args))
-                               (throw (ex-info (format "arity exception: expected %d arguments, got %d" (count (:args t1)) (count (:args t2)))
-                                               {:t1 (format-type t1) :t2 (format-type t2)})))
+    (= (:kind t1) :option) (unify-option t1 t2 subst)
+    (= (:kind t2) :option) (unify-option t2 t1 subst)
+    (and (= (:kind t1) :app) (= (:kind t2) :fn)) (unify-fn-app t2 t1 subst)
+    (and (= (:kind t2) :app) (= (:kind t1) :fn)) (unify-fn-app t1 t2 subst)
+    (and (= (:kind t1) :fn) (= (:kind t2) :fn)) (unify-fn-app t1 t2 subst)
     (and (= (:kind t1) :vector)
          (= (:kind t2) :vector)) (if (= (count (:items t1))
                                         (count (:items t2)))
@@ -281,15 +310,7 @@
                                    (throw (ex-info (format "incompatible vectors: expected %d items, got %d" (count (:items t1)) (count (:items t2)))
                                                    {:t1 t1 :t2 t2})))
     (and (= (:kind t1) :map)
-         (= (:kind t2) :map)) (if (= (count (:pairs t1))
-                                     (count (:pairs t2)))
-                                (reduce (fn [subst [[k1 v1] [k2 v2]]]
-                                          (println "unifying maps" k1 v1 "and" k2 v2)
-                                          (merge subst (unify k1 k2 subst) (unify v1 v2 subst)))
-                                        subst
-                                        (map list (:pairs t1) (:pairs t2)))
-                                (throw (ex-info (format "incompatible maps: expected %d pairs, got %d" (count (:pairs t1)) (count (:pairs t2)))
-                                                {:t1 t1 :t2 t2})))
+         (= (:kind t2) :map)) (unify-maps t2 t1 subst)
     :else (throw (ex-info (format "type mismatch. expected %s, got %s"
                                   (format-type t1) (format-type t2))
                           {:t1 t1 :t2 t2}))))
@@ -297,7 +318,7 @@
 (defn unify-eqs
   "Unifies all equations. Returns a substitution map."
   [equations]
-  (reduce (fn [subst {left :left right :right}]
+  (reduce (fn [subst [left right]]
             (if-let [subst (unify left right subst)]
               subst
               (reduced subst)))
@@ -318,10 +339,11 @@
      (= (:kind type) :string) type
      (= (:kind type) :macro) type
      (= (:kind type) :keyword) type
+     (= (:kind type) :option) type
      (= (:kind type) :special-form) type
      (= (:kind type) :vector) {:kind :vector :items (mapv #(substitute-type % subst (conj visited type)) (:items type))}
-     (= (:kind type) :map) {:kind :map :pairs (-> (map (fn [[key val]] [(substitute-type key subst (conj visited type))
-                                                                        (substitute-type val subst (conj visited type))])
+     (= (:kind type) :map) {:kind :map :pairs (->> (map (fn [[key val]] [(substitute-type key subst (conj visited type))
+                                                                         (substitute-type val subst (conj visited type))])
                                                        (:pairs type))
                                                   (into {}))}
      (= (:kind type) :tvar) (if (and (contains? subst type) (not (contains? visited type)))
@@ -342,7 +364,7 @@
 (defn rename
   "Renames all type variables in the given `type` sequentially starting from zero.
 
-  For example, type [t4 t5] -> t6 becomes [t0 t1] -> t2."
+  For example, type t4 → t5 → t6 becomes t0 → t1 → t2."
   [type names]
   (match type
     {:kind :tvar} (get @names type
@@ -350,15 +372,15 @@
                          (alter-meta! names update :count inc)
                          (swap! names assoc type value value value)
                          value))
-    {:kind :fn :args args :ret ret} (let [value {:kind :fn :args (map #(rename % names) args) :ret (rename ret names)}]
+    {:kind :fn :args args :ret ret} (let [value {:kind :fn :args (mapv #(rename % names) args) :ret (rename ret names)}]
                                       (swap! names assoc type value value value)
                                       value)
     {:kind :vector :items items} (let [value {:kind :vector :items (map #(rename % names) items)}]
                                    (swap! names assoc type value value value)
                                    value)
-    {:kind :map :pairs pairs} (let [value {:kind :map :pairs (-> (map (fn [[key val]] [(rename key names) (rename val names)])
-                                                                      (:pairs type))
-                                                                 (into {}))}]
+    {:kind :map :pairs pairs} (let [value {:kind :map :pairs (->> (map (fn [[key val]] [(rename key names) (rename val names)])
+                                                                       (:pairs type))
+                                                                  (into {}))}]
                                 (swap! names assoc type value value value)
                                 value)
     :else type))
@@ -398,7 +420,8 @@
   "Formats given type `t` for printing."
   [t]
   (match t
-    {:kind :fn :args args :ret ret} (format "[%s] → %s" (str/join ", " (map format-type args)) (format-type ret))
+    {:kind :fn :args args :ret ret} (format "(%s → %s)" (str/join " → " (map format-type args)) (format-type ret))
+    {:kind :app :args args :ret ret} (format "app (%s → %s)" (str/join " → " (map format-type args)) (format-type ret))
     {:kind :list :items items} (format "(%s)" (str/join " " (map format-type items)))
     {:kind :vector :items items} (format "[%s]" (str/join " " (map format-type items)))
     {:kind :map :pairs pairs} (format "{%s}" (str/join ", " (map #(str (format-type (first %)) " " (format-type (second %))) pairs)))
@@ -408,8 +431,11 @@
     {:kind :keyword :name name} (str name)
     {:kind :tvar :value val} (str (char (+ val 65))) ;(format "t%d" val)
     {:kind :tvar :value val :scope scope} (format "%s/t%d" (str scope) val)
+    {:kind :option :value val} (format "%s?" (format-type val))
+    {:kind :option :value val :default d} (format "%s?" (format-type val))
     :else (when ((some-fn number? boolean? string? keyword?) t)
             (format-type (type t)))))
+            ;(throw (ex-info "unsupported type" {:type t})))))
 
 (defn print-substitutions [subst]
   (print "Substitutions:")
@@ -420,9 +446,7 @@
   [eqs]
   (print "Type equations:")
   (clojure.pprint/print-table
-   (map (fn [{l :left r :right f :form}]
-          { "form" f "left" (format-type l) "right" (format-type r)})
-        eqs)))
+   (map (fn [[l r]] {:from (format-type l) :to (format-type r)}) eqs)))
 
 (defn eval-and-bind
   "Evaluates typed form `tform` and conditionally binds the result in a var so its type can be assigned."
@@ -484,7 +508,7 @@
   (-> '(if true {:foo 1} {:foo 2}) eval type format-type)
 
   (-> '(fn [[a b]] (+ a b)) eval type format-type)
-  (-> '(fn [{a :a b :b :or {a true}}] (+ a b)) eval type format-type)
+  (-> '(fn [{a :a b :b :or {a 1}}] (+ a b)) eval type format-type)
   
   (-> '(defn square [x] (* x x)) eval type format-type)
   (-> '(foo false? (fn [x] (* x x)) 5) eval)
