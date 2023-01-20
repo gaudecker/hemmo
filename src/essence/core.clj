@@ -154,81 +154,80 @@
 
 (defn gen-type-equations
   "Returns a map of type equations for the given `form` and its subforms."
-  ([form] (gen-type-equations form {}))
-  ([form equations]
-   (match form
-     (['defn docstring name args body] :seq) (gen-fn-type-equations form args body equations)
-     (['defn name args body] :seq) (gen-fn-type-equations form args body equations)
-     (['fn args body] :seq) (gen-fn-type-equations form args body equations)
-     (['if cond then else] :seq) (let [eqs (->> (gen-type-equations cond equations)
-                                                (gen-type-equations then)
-                                                (gen-type-equations else))]
-                                   (assoc eqs
-                                         (type cond) {:kind :boolean}
-                                         (type form) (type then)
-                                         (type form) (type else)))
-     (['let bindings body] :seq) (let [eqs (gen-type-equations body equations)
-                                       binding-eqs (reduce (fn [eqs [binding value]]
-                                                             (let [eqs (->> (gen-destructuring-type-equations binding eqs)
-                                                                            (gen-type-equations value))]
-                                                               (assoc eqs (type binding) (type value))))
-                                                           eqs (partition 2 bindings))]
-                                   (assoc binding-eqs (type form) (type body)))
-     :else
-     (cond
-       (list? form) (let [[first & rest] form
-                          eqs (conj (gen-type-equations first equations)
-                                    (reduce (fn [eqs n] (gen-type-equations n eqs)) {} rest))
-                          optype (type first)]
-                      (cond
-                        (applicable? optype) (assoc eqs (type first) {:kind :app :args (mapv type rest) :ret (type form)})
-                        :else (assoc eqs (type form) {:kind :list :items (map type form)})))
-       (vector? form) (let [eqs (reduce #(gen-type-equations %2 %1) equations form)]
-                        (assoc eqs (type form) {:kind :vector :items (mapv type form)}))
-       (map? form) (let [eqs (reduce (fn [eqs [key val]]
-                                       (conj eqs (gen-type-equations key) (gen-type-equations val)))
-                                     equations form)]
-                     (assoc eqs (type form) {:kind :map :pairs (->> (map #(vector (type (first %)) (type (second %))) form) (into {}))}))
-       (number? form) (assoc equations (type form) {:kind :number})
-       (string? form) (assoc equations (type form) {:kind :string})
-       (boolean? form) (assoc equations (type form) {:kind :boolean})
-       (keyword? form) (assoc equations (type form) {:kind :keyword :name (str form)})
-       (symbol? form) equations
-       :else (throw (ex-info "unsupported form" {:form form}))))))
-
-(comment
-  (->> '(let [{foo :a} {:a true :b 2} bar 2] (+ foo bar)) eval))
+  [form]
+  (match form
+    (['defn docstring name args body] :seq) (gen-fn-type-equations form args body)
+    (['defn name args body] :seq) (gen-fn-type-equations form args body)
+    (['fn args body] :seq) (gen-fn-type-equations form args body)
+    (['if cond then else] :seq) (conj (concat (gen-type-equations cond)
+                                              (gen-type-equations then)
+                                              (gen-type-equations else))
+                                      [(type cond) {:kind :boolean}]
+                                      [(type form) (type then)]
+                                      [(type form) (type else)])
+    (['let bindings body] :seq) (let [binding-eqs (reduce (fn [eqs [binding value]]
+                                                            (println "binding from" binding (type binding) "to" value (type value))
+                                                            (conj (concat eqs
+                                                                          (gen-destructuring-type-equations binding)
+                                                                          (gen-type-equations value)
+                                        ;(gen-let-binding-type-equations binding value)
+                                                                          )
+                                        ; TODO: binding symbol -> type of symbol in value recursively
+                                                                  [(type binding) (type value)]))
+                                                          [] (partition 2 bindings))
+                                      body-eqs (gen-type-equations body)]
+                                  (conj (concat body-eqs binding-eqs) [(type form) (type body)]))
+    :else
+    (cond
+      (list? form) (let [[first & rest] form
+                         eqs (concat (gen-type-equations first)
+                                     (reduce #(concat %1 (gen-type-equations %2)) [] rest))
+                         optype (type first)]
+                     (cond
+                       (applicable? optype) (conj eqs [(type first) {:kind :app :args (mapv type rest) :ret (type form)}])
+                       :else (conj eqs [(type form) {:kind :list :items (map type form)}])))
+      (vector? form) (conj (reduce #(concat %1 (gen-type-equations %2)) [] form)
+                           [(type form) {:kind :vector :items (mapv type form)}])
+      (map? form) (conj (reduce (fn [eqs [key val]]
+                                  (concat eqs (gen-type-equations key) (gen-type-equations val)))
+                                [] form)
+                        [(type form) {:kind :map :pairs (->> (map #(vector (type (first %)) (type (second %))) form) (into {}))}])
+      (number? form) [[(type form) {:kind :number}]]
+      (string? form) [[(type form) {:kind :string}]]
+      (boolean? form) [[(type form) {:kind :boolean}]]
+      (keyword? form) [[(type form) {:kind :keyword :name (str form)}]]
+      (symbol? form) []
+      :else (throw (ex-info "unsupported form" {:form form})))))
 
 (defn gen-fn-type-equations
   "Generates type equations for a function form."
-  [form args body equations]
-  (let [eqs (->> (reduce #(gen-destructuring-type-equations %2 %1) equations args)
-                 (gen-type-equations body))]
-    (assoc eqs (type form) {:kind :fn :args (mapv type args) :ret (type body)})))
+  [form args body]
+  (conj (concat (reduce #(concat %1 (gen-destructuring-type-equations %2)) [] args)
+                (gen-type-equations body))
+        [(type form) {:kind :fn :args (mapv type args) :ret (type body)}]))
 
 (defn gen-destructuring-type-equations
-  ([form] (gen-destructuring-type-equations form {}))
-  ([form equations]
-   (cond
-     (symbol? form) equations
-     (vector? form) (assoc (reduce #(gen-destructuring-type-equations %2 %1) equations form)
-                           (type form) {:kind :vector :items (mapv type form)})
-     (map? form) (let [eqs (reduce (fn [eqs [val key]]
-                                     (cond
-                                       ;; :as binding gets the type of the surrounding map form
-                                       (and (= val :as) (symbol? key)) (assoc eqs (type key) (type form))
-                                       ;; :or symbols get the type of their form
-                                       (and (= val :or) (map? key)) (reduce (fn [eqs [sym val]]
-                                                                              (assoc eqs (type sym) {:kind :option :value (type val) :default true}))
-                                                                            eqs key)
-                                       ;; keyword binding gets destructured further (val is either sym, vec, or map)
-                                       (keyword? key) (gen-destructuring-type-equations val eqs)
-                                       :else (throw (ex-info "invalid map destructuring form" {:key val :value key :form form}))))
-                                   equations form)]
-                   (assoc eqs (type form) {:kind :map :pairs (->> (filter #(and (not= (first %) :or) (not= (first %) :as)) form)
-                                                                 (map #(vector (type (second %)) (type (first %))))
-                                                                 (into {}))}))
-     :else (throw (ex-info "invalid destructuring form" {:form form})))))
+  [form]
+  (cond
+    (symbol? form) []
+    (vector? form) (conj (reduce #(gen-destructuring-type-equations %2 %1) [] form)
+                         [(type form) {:kind :vector :items (mapv type form)}])
+    (map? form) (conj (reduce (fn [eqs [val key]]
+                                (cond
+                                  ;; :as binding gets the type of the surrounding map form
+                                  (and (= val :as) (symbol? key)) (conj eqs [(type key) (type form)])
+                                  ;; :or symbols get the type of their form
+                                  (and (= val :or) (map? key)) (reduce (fn [eqs [sym val]]
+                                                                         (conj eqs [(type sym) {:kind :option :value (type val) :default true}]))
+                                                                       eqs key)
+                                  ;; keyword binding gets destructured further (val is either sym, vec, or map)
+                                  (keyword? key) (gen-destructuring-type-equations val)
+                                  :else (throw (ex-info "invalid map destructuring form" {:key val :value key :form form}))))
+                              [] form)
+                      [(type form) {:kind :map :pairs (->> (filter #(and (not= (first %) :or) (not= (first %) :as)) form)
+                                                           (map #(vector (type (second %)) (type (first %))))
+                                                           (into {}))}])
+    :else (throw (ex-info "invalid destructuring form" {:form form}))))
 
 (comment
   (gen-destructuring-type-equations (assign-type (env/make) '{a :a :or {a 1}})))
@@ -451,7 +450,6 @@
     {:kind :option :value val :default d} (format "%s?" (format-type val))
     :else (when ((some-fn number? boolean? string? keyword?) t)
             (format-type (type t)))))
-            ;(throw (ex-info "unsupported type" {:type t})))))
 
 (defn print-substitutions [subst]
   (print "Substitutions:")
