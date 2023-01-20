@@ -47,11 +47,3 @@
   ([env symbol]
    (get @env symbol (if-let [var (clojure.core/resolve symbol)]
                       (essence.core/type var)))))
-
-(defn from-ns
-  ([] (from-ns *ns*))
-  ([ns]
-   (if (contains? (meta ns) :env)
-     (-> (meta ns) :env)
-     (do (alter-meta! ns assoc :env (make *core-ctx*))
-         (from-ns ns)))))
