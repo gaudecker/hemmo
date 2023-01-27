@@ -1,2 +1,2 @@
-{:paths ["src/essence"]
+{;:paths ["src/hemmo"]
  :deps {org.clojure/core.match {:mvn/version "1.0.1"}}}

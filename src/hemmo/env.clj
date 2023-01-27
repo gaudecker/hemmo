@@ -1,4 +1,4 @@
-(ns essence.env)
+(ns hemmo.env)
 
 (def ^:dynamic *core-ctx*
   "Core function types."
@@ -40,10 +40,3 @@
    (let [count (:tvar-count (meta env) 0)]
      (alter-meta! env assoc :tvar-count (inc count))
      {:kind :tvar :value count})))
-
-(defn resolve
-  "Returns the type of a given `symbol` in enviroment `env`."
-  ([symbol] (resolve (from-ns) symbol))
-  ([env symbol]
-   (get @env symbol (if-let [var (clojure.core/resolve symbol)]
-                      (essence.core/type var)))))
